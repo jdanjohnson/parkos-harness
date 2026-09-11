@@ -1,0 +1,9 @@
+services:
+  harness:
+    build: .
+    volumes: [".:/work"]
+    environment:
+      PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://platform:8080}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://gateway:8081}
+      ATTEMPT_TOKEN: ${ATTEMPT_TOKEN:-}
+    command: sleep infinity

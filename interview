@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""./interview — candidate CLI for the ParkOS harness. Stdlib only.
+
+  start        register this machine with the platform (needs ATTEMPT_TOKEN)
+  status       phase, time remaining, AI policy, pack state, public tests
+  pack         fetch + unseal the problem pack (auto at Phase 2; Phase B files unhide at Phase 3)
+  test         run public tests for the current phase
+  replay F     run the candidate handler over fixture F and print decisions
+  checkpoint   commit working tree + tag (used by the Phase 3 auto-loop)
+  watch        Phase 3 auto-commit loop (every 5 min -> p3/00, p3/05, ...)
+  submit       bundle repo @ HEAD + public results -> platform
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROBLEM = os.path.join(ROOT, "problem")
+STATE = os.path.join(ROOT, ".interview_state.json")
+PLATFORM = os.environ.get("PLATFORM_BASE_URL", "https://parkos.stationed.net").rstrip("/")
+TOKEN = os.environ.get("ATTEMPT_TOKEN", "")
+PHASES = ["lobby", "discover_design", "engineering_core", "ai_extension", "defense", "closed"]
+POLICY = {"lobby": "n/a", "discover_design": "OFF", "engineering_core": "OFF", "ai_extension": "ON",
+          "defense": "OFF", "closed": "n/a"}
+LABEL = {"lobby": "Lobby", "discover_design": "Phase 1 · Discover + Design", "engineering_core": "Phase 2 · Engineering core",
+         "ai_extension": "Phase 3 · AI-native extension", "defense": "Phase 4 · Defense", "closed": "Closed"}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def api(method: str, path: str, data: bytes | None = None, headers: dict | None = None, raw: bool = False):
+    if not TOKEN:
+        die("ATTEMPT_TOKEN not set (it is in your interview email / the platform lobby page)")
+    h = {"Authorization": f"Bearer {TOKEN}"}
+    h.update(headers or {})
+    req = urllib.request.Request(f"{PLATFORM}/api/cli/{path}", data=data, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            return body if raw else json.loads(body or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"{exc.code} {path}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"platform unreachable at {PLATFORM}: {exc.reason}") from exc
+
+
+def post_json(path: str, obj: dict):
+    return api("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+
+
+def load_state() -> dict:
+    return json.load(open(STATE)) if os.path.exists(STATE) else {}
+
+
+def save_state(s: dict) -> None:
+    if TOKEN:
+        s = {**s, "attempt_token": TOKEN}
+    with open(STATE, "w") as fh:
+        json.dump(s, fh, indent=2)
+
+
+def git(*args: str, check: bool = True) -> str:
+    r = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=False)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def phase_index(p: str) -> int:
+    return PHASES.index(p) if p in PHASES else -1
+
+
+def remaining(st: dict) -> str:
+    try:
+        end = datetime.fromisoformat(st["phase_ends_at"].replace("Z", "+00:00"))
+        now = datetime.fromisoformat(st["server_time"].replace("Z", "+00:00"))
+    except (KeyError, ValueError, AttributeError, TypeError):
+        return "--:--"
+    secs = max(0, int((end - now).total_seconds()))
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+# ---------------------------------------------------------------- pack handling
+def pack_loaded() -> bool:
+    return os.path.exists(os.path.join(PROBLEM, "pack.json"))
+
+
+def phase_b_unlocked() -> bool:
+    return pack_loaded() and not os.path.isdir(os.path.join(PROBLEM, ".phase_b"))
+
+
+def unseal(tgz: bytes) -> dict:
+    if pack_loaded():
+        return json.load(open(os.path.join(PROBLEM, "pack.json")))
+    with tarfile.open(fileobj=io.BytesIO(tgz), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            if m.name.startswith("/") or ".." in m.name.split("/"):
+                die(f"unsafe path in pack: {m.name}")
+        tar.extractall(PROBLEM)
+    with open(os.path.join(PROBLEM, "pack.json")) as fh:
+        meta = json.load(fh)
+    hidden = os.path.join(PROBLEM, ".phase_b")
+    os.makedirs(hidden, exist_ok=True)
+    for rel in meta.get("phase_b_files", []):
+        src = os.path.join(PROBLEM, rel)
+        if os.path.exists(src):
+            dst = os.path.join(hidden, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+    write_task_md(meta, phase_b=False)
+    return meta
+
+
+def unhide_phase_b() -> None:
+    with open(os.path.join(PROBLEM, "pack.json")) as fh:
+        meta = json.load(fh)
+    hidden = os.path.join(PROBLEM, ".phase_b")
+    if not os.path.isdir(hidden):
+        return
+    for rel in meta.get("phase_b_files", []):
+        src = os.path.join(hidden, rel)
+        if os.path.exists(src):
+            dst = os.path.join(PROBLEM, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+    shutil.rmtree(hidden, ignore_errors=True)
+    write_task_md(meta, phase_b=True)
+
+
+def write_task_md(meta: dict, phase_b: bool) -> None:
+    parts = []
+    for name in ["BRIEF.md", "TASK_A.md"] + (["TASK_B.md"] if phase_b else []):
+        p = os.path.join(PROBLEM, name)
+        if os.path.exists(p):
+            with open(p) as fh:
+                parts.append(fh.read().rstrip() + "\n")
+    with open(os.path.join(ROOT, "TASK.md"), "w") as fh:
+        fh.write(f"<!-- generated by ./interview from problem pack {meta.get('variant')} — do not edit -->\n\n")
+        fh.write("\n---\n\n".join(parts))
+
+
+def sync_pack(st: dict, verbose: bool = True) -> None:
+    """Idempotent: make local pack state match the server phase."""
+    idx = phase_index(st.get("phase", ""))
+    if idx >= phase_index("engineering_core") and not pack_loaded():
+        t0 = time.time()
+        meta = unseal(api("GET", "pack", raw=True))
+        if verbose:
+            print(f"Problem pack loaded: {meta['variant']} ({time.time() - t0:.1f}s) → TASK.md, problem/")
+    if idx >= phase_index("ai_extension") and pack_loaded() and not phase_b_unlocked():
+        unhide_phase_b()
+        if verbose:
+            print("Phase 3 unlocked: TASK_B.md appended to TASK.md; build fixtures + tests now in problem/")
+
+
+def pin_design_record(st: dict) -> None:
+    dst = os.path.join(ROOT, "DESIGN_PLAN.md")
+    if phase_index(st.get("phase", "")) >= phase_index("engineering_core") and not os.path.exists(dst):
+        try:
+            with open(dst, "wb") as fh:
+                fh.write(api("GET", "design_record", raw=True))
+            print("Design Plan pinned → DESIGN_PLAN.md")
+        except RuntimeError as exc:
+            print(f"(design record not available yet: {exc})")
+
+
+# ---------------------------------------------------------------- tests
+def run_pytest(paths: list[str], quiet: bool = False) -> tuple[int, str]:
+    if not paths:
+        return 0, "no tests for this phase yet"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA", *paths],
+                       cwd=ROOT, capture_output=True, text=True, check=False)
+    out = r.stdout + r.stderr
+    if not quiet:
+        print("\n".join(line for line in out.splitlines() if not line.startswith("PASSED ") and not line.startswith("=") or "short test summary" in line or " in " in line))
+    return r.returncode, out
+
+
+def public_test_paths() -> list[str]:
+    paths = []
+    for name in ("test_public_core.py", "test_public_build.py"):
+        p = os.path.join(PROBLEM, "tests", name)
+        if os.path.exists(p):
+            paths.append(p)
+    return paths
+
+
+def public_summary() -> str:
+    paths = public_test_paths()
+    if not paths:
+        return "no problem pack"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--co", *paths],
+                       cwd=ROOT, capture_output=True, text=True, check=False)
+    total = sum(1 for line in r.stdout.splitlines() if "::" in line)
+    results = os.path.join(ROOT, "public_results.json")
+    passing = "?"
+    if os.path.exists(results):
+        try:
+            with open(results) as fh:
+                passing = json.load(fh).get("passed", "?")
+        except json.JSONDecodeError:
+            pass
+    return f"{total} public tests · {passing} passing (last run)"
+
+
+# ---------------------------------------------------------------- commands
+def cmd_start() -> None:
+    st = post_json("start", {"host": os.uname().nodename, "python": sys.version.split()[0]})
+    save_state(st)
+    print(f"Registered attempt {st['attempt_id']} · role {st['role'].upper()} · phase {st['phase']}")
+    os.environ.setdefault("MODEL_BASE_URL", st.get("gateway_url", ""))
+    sync_pack(st)
+    pin_design_record(st)
+
+
+def cmd_status() -> None:
+    st = api("GET", "status")
+    save_state(st)
+    sync_pack(st)
+    pin_design_record(st)
+    ph = st["phase"]
+    print(f"{LABEL.get(ph, ph)} · {remaining(st)} remaining · AI coding tools: {POLICY.get(ph, '?')}"
+          + (f" · application models: {'ON' if ph == 'ai_extension' else 'OFF'}" if ph in ('engineering_core', 'ai_extension') else ""))
+    print(f"Problem pack: {'loaded — ' + public_summary() if pack_loaded() else 'sealed until Phase 2'}"
+          + ("" if not pack_loaded() else (" · Phase B: unlocked" if phase_b_unlocked() else " · Phase B: hidden until Phase 3")))
+    if os.path.exists(os.path.join(ROOT, "DESIGN_PLAN.md")):
+        print("Design Plan pinned → DESIGN_PLAN.md")
+
+
+def cmd_pack() -> None:
+    st = api("GET", "status")
+    save_state(st)
+    if phase_index(st["phase"]) < phase_index("engineering_core"):
+        die(f"problem pack is sealed until Phase 2 (current: {st['phase']})", 3)
+    sync_pack(st)
+    print("pack ok")
+
+
+def cmd_test() -> None:
+    if not pack_loaded():
+        die("no problem pack yet — run ./interview status", 3)
+    code, out = run_pytest(public_test_paths())
+    # parse pytest summary line
+    m = re.search(r"(\d+) passed", out)
+    passed = int(m.group(1)) if m else 0
+    m = re.search(r"(\d+) failed", out)
+    failed = int(m.group(1)) if m else 0
+    checks = {m2.group(2).split("[")[-1].rstrip("]"): m2.group(1) for m2 in re.finditer(r"^(PASSED|FAILED|ERROR) (\S+)", out, re.MULTILINE)}
+    results = {"passed": passed, "failed": failed, "exit_code": code, "checks": checks,
+               "ran_at": datetime.now(timezone.utc).isoformat()}
+    with open(os.path.join(ROOT, "public_results.json"), "w") as fh:
+        json.dump(results, fh, indent=2)
+    try:
+        api("POST", "test_results", data=json.dumps(results).encode(), headers={"Content-Type": "application/json"})
+    except (RuntimeError, OSError):
+        pass
+    sys.exit(code)
+
+
+def cmd_replay(fixture: str, builder: str = "candidate.main:build") -> None:
+    sys.path.insert(0, ROOT)
+    from harness.runner import load_builder, run_fixture
+    model = None
+    if phase_b_unlocked():
+        from scaffold.model import ModelClient
+        model = ModelClient()
+    res = run_fixture(fixture, load_builder(builder), model=model)
+    for d in res["decisions"]:
+        acts = ", ".join(a["type"] for a in d["actions"]) or "-"
+        flags = ",".join(d["flags"])
+        print(f"{d['event_id']:<10} {acts:<40} {'ESC ' if d['escalated'] else '    '}{flags}")
+    if res["errors"]:
+        print(f"\n{len(res['errors'])} handler errors:")
+        for e in res["errors"]:
+            print(f"  {e['event_id']}: {e['error']}")
+    print("\nledger:", json.dumps(res["ledger"]["spots"], indent=1))
+
+
+def cmd_checkpoint(tag: str | None = None) -> str:
+    git("add", "-A", "--", ".", ":!problem/", ":!.interview_state.json")
+    git("commit", "-q", "--allow-empty", "-m", f"checkpoint {tag or datetime.now(timezone.utc).strftime('%H:%M:%SZ')}", check=True)
+    sha = git("rev-parse", "--short", "HEAD")
+    if tag:
+        git("tag", "-f", tag, check=False)
+    diffstat = git("show", "--stat", "--oneline", "HEAD", check=False).splitlines()[-1] if tag else ""
+    st = load_state()
+    try:
+        post_json("checkpoint", {"sha": sha, "phase": st.get("phase", "?"), "diffstat": diffstat, "tag": tag or ""})
+    except RuntimeError as exc:
+        print(f"(checkpoint recorded locally only: {exc})")
+    print(f"checkpoint {tag or ''} {sha}")
+    return sha
+
+
+def cmd_watch(interval: int = 300) -> None:
+    """Phase 3 auto-commit loop. Exits when phase leaves ai_extension."""
+    print(f"auto-checkpoint every {interval}s during Phase 3 (Ctrl-C to stop; the platform records each one)")
+    n = 0
+    while True:
+        st = api("GET", "status")
+        save_state(st)
+        sync_pack(st, verbose=False)
+        if st["phase"] == "ai_extension":
+            cmd_checkpoint(f"p3/{n * interval // 60:02d}")
+            n += 1
+        elif phase_index(st["phase"]) > phase_index("ai_extension"):
+            print("Phase 3 over — final checkpoint p3/end")
+            cmd_checkpoint("p3/end")
+            return
+        time.sleep(interval)
+
+
+def cmd_submit() -> None:
+    st = api("GET", "status")
+    save_state(st)
+    sha = cmd_checkpoint("submit")
+    code, _ = run_pytest(public_test_paths(), quiet=True)
+    results_path = os.path.join(ROOT, "public_results.json")
+    if not os.path.exists(results_path):
+        with open(results_path, "w") as fh:
+            json.dump({"passed": 0, "failed": 0, "exit_code": code}, fh)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in os.listdir(ROOT):
+            if name in ("__pycache__", ".pytest_cache", ".interview_state.json"):
+                continue
+            tar.add(os.path.join(ROOT, name), arcname=name,
+                    filter=lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti)
+    boundary = "----parkos" + str(int(time.time()))
+    body = io.BytesIO()
+
+    def part(name: str, filename: str, ctype: str, data: bytes) -> None:
+        body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                   f"Content-Type: {ctype}\r\n\r\n".encode())
+        body.write(data)
+        body.write(b"\r\n")
+
+    part("bundle", "bundle.tar.gz", "application/gzip", buf.getvalue())
+    with open(results_path, "rb") as fh:
+        part("public_results", "public_results.json", "application/json", fh.read())
+    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"sha\"\r\n\r\n{sha}\r\n--{boundary}--\r\n".encode())
+    resp = api("POST", "submit", body.getvalue(), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    print(f"submitted {sha} → submission {resp.get('submission_id')}. Your working tree is frozen for scoring; you may keep the editor open.")
+
+
+def main(argv: list[str]) -> None:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, *rest = argv
+    try:
+        if cmd == "start":
+            cmd_start()
+        elif cmd == "status":
+            cmd_status()
+        elif cmd == "pack":
+            cmd_pack()
+        elif cmd == "test":
+            cmd_test()
+        elif cmd == "replay":
+            if not rest:
+                die("usage: ./interview replay <fixture.jsonl> [module:build]")
+            cmd_replay(*rest)
+        elif cmd == "checkpoint":
+            cmd_checkpoint(rest[0] if rest else None)
+        elif cmd == "watch":
+            cmd_watch(int(rest[0]) if rest else 300)
+        elif cmd == "submit":
+            cmd_submit()
+        else:
+            die(f"unknown command {cmd!r}; see ./interview help")
+    except RuntimeError as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

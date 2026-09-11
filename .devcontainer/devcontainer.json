@@ -1,0 +1,9 @@
+{
+  "name": "ParkOS harness",
+  "build": {"dockerfile": "../Dockerfile", "context": ".."},
+  "workspaceFolder": "/work",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/work,type=bind",
+  "remoteEnv": {"PYTHONPATH": "/work"},
+  "postCreateCommand": "./check",
+  "customizations": {"vscode": {"extensions": ["ms-python.python"]}}
+}

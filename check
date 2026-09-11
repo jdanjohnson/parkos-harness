@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""./check — T-24h preflight. Exits 0 iff this machine is ready for the interview.
+
+Verifies: python version, pytest importable, scaffold self-test (ledger/events/decisions),
+harness self-tests, git identity, platform reachability (if ATTEMPT_TOKEN set), gateway reachability (optional).
+"""
+from __future__ import annotations
+
+import importlib
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+results: list[tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    results.append((name, ok, detail))
+    print(f"[{'ok' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+
+
+def main() -> int:
+    v = sys.version_info
+    check("python >= 3.10", v >= (3, 10), f"{v.major}.{v.minor}.{v.micro}")
+    try:
+        importlib.import_module("pytest")
+        check("pytest importable", True)
+    except ImportError:
+        check("pytest importable", False, "pip install -e '.[dev]'  (or use the container)")
+
+    try:
+        from scaffold.decisions import Decision
+        from scaffold.events import Event
+        from scaffold.ledger import Ledger
+        led = Ledger()
+        led.assign_spot("A1", "ABC123", evidence=["e1"])
+        led.record_payment("p1", "ABC123", 1800, evidence=["e2"])
+        ev = Event.from_dict({"id": "e1", "type": "app.checkin", "ts": "2026-09-10T12:00:00Z", "source": "app",
+                              "payload": {"spot": "A1", "plate": "ABC123"}})
+        d = Decision(event_id=ev.id).add("assign_spot", spot="A1", plate="ABC123").to_dict()
+        ok = (led.get_spot("A1").plate == "ABC123" and led.payments("ABC123")[0].amount == 1800
+              and d["actions"][0]["spot"] == "A1" and len(led.history()) == 2)
+        check("scaffold self-test", ok)
+    except Exception as exc:  # noqa: BLE001
+        check("scaffold self-test", False, repr(exc))
+
+    tests = os.path.join(ROOT, "harness", "tests")
+    if os.path.isdir(tests):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", tests],
+                           cwd=ROOT, capture_output=True, text=True)
+        check("harness self-tests", r.returncode == 0, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-200:])
+
+    r = subprocess.run(["git", "config", "user.email"], cwd=ROOT, capture_output=True, text=True)
+    check("git identity", bool(r.stdout.strip()), r.stdout.strip() or "git config user.email <you>")
+    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT, capture_output=True, text=True)
+    check("git repo", r.stdout.strip() == "true")
+
+    from scaffold.events import ALL_SPOTS  # noqa: F401 - import path sanity
+    check("problem/ empty (pack sealed)", not os.path.exists(os.path.join(ROOT, "problem", "pack.json")))
+
+    platform = os.environ.get("PLATFORM_BASE_URL", "https://parkos.stationed.net")
+    token = os.environ.get("ATTEMPT_TOKEN")
+    if token:
+        try:
+            req = urllib.request.Request(f"{platform.rstrip('/')}/api/cli/status", headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                check("platform reachable", resp.status == 200, platform)
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            check("platform reachable", False, str(exc))
+    else:
+        check("platform reachable", True, "skipped (set ATTEMPT_TOKEN to verify)")
+
+    gw = os.environ.get("MODEL_BASE_URL")
+    if gw:
+        try:
+            with urllib.request.urlopen(f"{gw.rstrip('/')}/healthz", timeout=5) as resp:
+                check("gateway reachable", resp.status == 200, gw)
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            check("gateway reachable", False, str(exc))
+
+    failed = [n for n, ok, _ in results if not ok]
+    print("\nREADY" if not failed else f"\nNOT READY: {', '.join(failed)}")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
