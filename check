@@ -7,6 +7,7 @@ harness self-tests, git identity, platform reachability (if ATTEMPT_TOKEN set), 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -31,6 +32,14 @@ def main() -> int:
         check("pytest importable", True)
     except ImportError:
         check("pytest importable", False, "pip install -e '.[dev]'  (or use the container)")
+
+    # Data-track roles (INTERVIEW_ROLE=mle) need pandas + numpy; for other roles this is informational only.
+    role = os.environ.get("INTERVIEW_ROLE", "").lower()
+    missing = [m for m in ("pandas", "numpy") if importlib.util.find_spec(m) is None]
+    if role == "mle":
+        check("pandas + numpy importable (MLE track)", not missing, "pip install -e '.[dev,data]'" if missing else "")
+    elif missing:
+        print(f"[note] pandas/numpy not installed ({', '.join(missing)}) — only needed for the MLE track (INTERVIEW_ROLE=mle)")
 
     try:
         from scaffold.decisions import Decision

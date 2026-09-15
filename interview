@@ -3,12 +3,15 @@
 
   start        register this machine with the platform (needs ATTEMPT_TOKEN)
   status       phase, time remaining, AI policy, pack state, public tests
-  pack         fetch + unseal the problem pack (auto at Phase 2; Phase B files unhide at Phase 3)
+  pack         fetch + unseal the problem pack (auto when the server says the pack is open; Part B files unhide later)
   test         run public tests for the current phase
-  replay F     run the candidate handler over fixture F and print decisions
-  checkpoint   commit working tree + tag (used by the Phase 3 auto-loop)
-  watch        Phase 3 auto-commit loop (every 5 min -> p3/00, p3/05, ...)
+  replay F     run the candidate handler over fixture F and print decisions (core track)
+  checkpoint   commit working tree + tag (used by the auto-loop)
+  watch        auto-commit loop while the server reports a checkpoint phase (every 5 min -> <prefix>/00, /05, ...)
   submit       bundle repo @ HEAD + public results -> platform
+
+Phases, AI policy and what is unsealed when are decided by the platform (/api/cli/status), not by this file;
+the same CLI serves every role.
 """
 from __future__ import annotations
 
@@ -30,11 +33,7 @@ PROBLEM = os.path.join(ROOT, "problem")
 STATE = os.path.join(ROOT, ".interview_state.json")
 PLATFORM = os.environ.get("PLATFORM_BASE_URL", "https://parkos.stationed.net").rstrip("/")
 TOKEN = os.environ.get("ATTEMPT_TOKEN", "")
-PHASES = ["lobby", "discover_design", "engineering_core", "ai_extension", "defense", "closed"]
-POLICY = {"lobby": "n/a", "discover_design": "OFF", "engineering_core": "OFF", "ai_extension": "ON",
-          "defense": "OFF", "closed": "n/a"}
-LABEL = {"lobby": "Lobby", "discover_design": "Phase 1 · Discover + Design", "engineering_core": "Phase 2 · Engineering core",
-         "ai_extension": "Phase 3 · AI-native extension", "defense": "Phase 4 · Defense", "closed": "Closed"}
+RECORD_FILE = {"design": "DESIGN_PLAN.md", "verdict": "VERDICT_RECORD.md"}
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -81,8 +80,9 @@ def git(*args: str, check: bool = True) -> str:
     return r.stdout.strip()
 
 
-def phase_index(p: str) -> int:
-    return PHASES.index(p) if p in PHASES else -1
+def flag(st: dict, name: str) -> bool:
+    """Server-driven phase flags (pack_open, phase_b_open, submit_open, record_locked). Missing = False."""
+    return bool(st.get(name, False))
 
 
 def remaining(st: dict) -> str:
@@ -123,7 +123,36 @@ def unseal(tgz: bytes) -> dict:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.move(src, dst)
     write_task_md(meta, phase_b=False)
+    install_starter_files(meta)
+    check_requires(meta)
     return meta
+
+
+def install_starter_files(meta: dict) -> list[str]:
+    """Copy pack starter files into candidate/ once (never overwrite the candidate's edits). Files still hidden in
+    .phase_b are skipped and picked up when Part B unhides."""
+    installed = []
+    for rel, dst_rel in meta.get("starter_files", {}).items():
+        src, dst = os.path.join(PROBLEM, rel), os.path.join(ROOT, dst_rel)
+        if os.path.exists(src) and not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            installed.append(dst_rel)
+    if installed:
+        print("Starter files → " + ", ".join(installed) + "  (yours to edit)")
+    return installed
+
+
+def check_requires(meta: dict) -> None:
+    missing = []
+    for mod in meta.get("requires", []):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        print(f"WARNING: this pack needs {', '.join(missing)} — install now: {sys.executable} -m pip install {' '.join(missing)}",
+              file=sys.stderr)
 
 
 def unhide_phase_b() -> None:
@@ -140,11 +169,12 @@ def unhide_phase_b() -> None:
             shutil.move(src, dst)
     shutil.rmtree(hidden, ignore_errors=True)
     write_task_md(meta, phase_b=True)
+    install_starter_files(meta)
 
 
 def write_task_md(meta: dict, phase_b: bool) -> None:
     parts = []
-    for name in ["BRIEF.md", "TASK_A.md"] + (["TASK_B.md"] if phase_b else []):
+    for name in list(meta.get("task_docs", ["BRIEF.md", "TASK_A.md"])) + (["TASK_B.md"] if phase_b else []):
         p = os.path.join(PROBLEM, name)
         if os.path.exists(p):
             with open(p) as fh:
@@ -155,33 +185,39 @@ def write_task_md(meta: dict, phase_b: bool) -> None:
 
 
 def sync_pack(st: dict, verbose: bool = True) -> None:
-    """Idempotent: make local pack state match the server phase."""
-    idx = phase_index(st.get("phase", ""))
-    if idx >= phase_index("engineering_core") and not pack_loaded():
+    """Idempotent: make local pack state match the server's flags."""
+    if flag(st, "pack_open") and not pack_loaded():
         t0 = time.time()
         meta = unseal(api("GET", "pack", raw=True))
         if verbose:
             print(f"Problem pack loaded: {meta['variant']} ({time.time() - t0:.1f}s) → TASK.md, problem/")
-    if idx >= phase_index("ai_extension") and pack_loaded() and not phase_b_unlocked():
+    if flag(st, "phase_b_open") and pack_loaded() and not phase_b_unlocked():
         unhide_phase_b()
         if verbose:
-            print("Phase 3 unlocked: TASK_B.md appended to TASK.md; build fixtures + tests now in problem/")
+            print("Part B unlocked: TASK_B.md appended to TASK.md; its fixtures + tests are now in problem/")
+
+
+def record_file(st: dict) -> str:
+    return os.path.join(ROOT, RECORD_FILE.get(st.get("record_kind", "design"), "DESIGN_PLAN.md"))
 
 
 def pin_design_record(st: dict) -> None:
-    dst = os.path.join(ROOT, "DESIGN_PLAN.md")
-    if phase_index(st.get("phase", "")) >= phase_index("engineering_core") and not os.path.exists(dst):
+    """Once the server has locked the pre-build record (Design Plan / Verdict Record), pin a copy into the repo."""
+    dst = record_file(st)
+    if flag(st, "record_locked") and not os.path.exists(dst):
         try:
             with open(dst, "wb") as fh:
                 fh.write(api("GET", "design_record", raw=True))
-            print("Design Plan pinned → DESIGN_PLAN.md")
+            print(f"{st.get('record_kind', 'design').title()} record pinned → {os.path.basename(dst)}")
         except RuntimeError as exc:
-            print(f"(design record not available yet: {exc})")
+            print(f"(record not available yet: {exc})")
 
 
 # ---------------------------------------------------------------- tests
 def run_pytest(paths: list[str], quiet: bool = False) -> tuple[int, str]:
     if not paths:
+        if not quiet:
+            print("no tests for this phase yet — public tests arrive when the next part unseals")
         return 0, "no tests for this phase yet"
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA", *paths],
                        cwd=ROOT, capture_output=True, text=True, check=False)
@@ -192,18 +228,16 @@ def run_pytest(paths: list[str], quiet: bool = False) -> tuple[int, str]:
 
 
 def public_test_paths() -> list[str]:
-    paths = []
-    for name in ("test_public_core.py", "test_public_build.py"):
-        p = os.path.join(PROBLEM, "tests", name)
-        if os.path.exists(p):
-            paths.append(p)
-    return paths
+    tests = os.path.join(PROBLEM, "tests")
+    if not os.path.isdir(tests):
+        return []
+    return sorted(os.path.join(tests, n) for n in os.listdir(tests) if n.startswith("test_public_") and n.endswith(".py"))
 
 
 def public_summary() -> str:
     paths = public_test_paths()
     if not paths:
-        return "no problem pack"
+        return "no public tests yet"
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--co", *paths],
                        cwd=ROOT, capture_output=True, text=True, check=False)
     total = sum(1 for line in r.stdout.splitlines() if "::" in line)
@@ -234,19 +268,21 @@ def cmd_status() -> None:
     sync_pack(st)
     pin_design_record(st)
     ph = st["phase"]
-    print(f"{LABEL.get(ph, ph)} · {remaining(st)} remaining · AI coding tools: {POLICY.get(ph, '?')}"
-          + (f" · application models: {'ON' if ph == 'ai_extension' else 'OFF'}" if ph in ('engineering_core', 'ai_extension') else ""))
-    print(f"Problem pack: {'loaded — ' + public_summary() if pack_loaded() else 'sealed until Phase 2'}"
-          + ("" if not pack_loaded() else (" · Phase B: unlocked" if phase_b_unlocked() else " · Phase B: hidden until Phase 3")))
-    if os.path.exists(os.path.join(ROOT, "DESIGN_PLAN.md")):
-        print("Design Plan pinned → DESIGN_PLAN.md")
+    print(f"{st.get('label', ph)} · {remaining(st)} remaining · AI coding tools: {st.get('coding_ai', '?')}"
+          + (f" · application models: {st['models']}" if st.get("models") else ""))
+    print(f"Problem pack: {'loaded — ' + public_summary() if pack_loaded() else 'sealed (opens in a later phase)'}"
+          + ("" if not pack_loaded() else (" · Part B: unlocked" if phase_b_unlocked() else " · Part B: hidden until a later phase"))
+          + ("" if flag(st, "submit_open") else " · submissions closed right now"))
+    rf = record_file(st)
+    if os.path.exists(rf):
+        print(f"{st.get('record_kind', 'design').title()} record pinned → {os.path.basename(rf)}")
 
 
 def cmd_pack() -> None:
     st = api("GET", "status")
     save_state(st)
-    if phase_index(st["phase"]) < phase_index("engineering_core"):
-        die(f"problem pack is sealed until Phase 2 (current: {st['phase']})", 3)
+    if not flag(st, "pack_open"):
+        die(f"problem pack is sealed (current phase: {st['phase']})", 3)
     sync_pack(st)
     print("pack ok")
 
@@ -308,19 +344,24 @@ def cmd_checkpoint(tag: str | None = None) -> str:
 
 
 def cmd_watch(interval: int = 300) -> None:
-    """Phase 3 auto-commit loop. Exits when phase leaves ai_extension."""
-    print(f"auto-checkpoint every {interval}s during Phase 3 (Ctrl-C to stop; the platform records each one)")
+    """Auto-commit loop for the phase(s) the server tags with a checkpoint_prefix (AI-on build phases).
+    Exits with a final <prefix>/end checkpoint once the server stops reporting a prefix."""
+    print(f"auto-checkpoint every {interval}s while the server reports a checkpoint phase (Ctrl-C to stop; the platform records each one)")
     n = 0
+    prefix = None
     while True:
         st = api("GET", "status")
         save_state(st)
         sync_pack(st, verbose=False)
-        if st["phase"] == "ai_extension":
-            cmd_checkpoint(f"p3/{n * interval // 60:02d}")
+        pin_design_record(st)
+        cur = st.get("checkpoint_prefix")
+        if cur:
+            prefix = cur
+            cmd_checkpoint(f"{prefix}/{n * interval // 60:02d}")
             n += 1
-        elif phase_index(st["phase"]) > phase_index("ai_extension"):
-            print("Phase 3 over — final checkpoint p3/end")
-            cmd_checkpoint("p3/end")
+        elif prefix:
+            print(f"checkpoint phase over — final checkpoint {prefix}/end")
+            cmd_checkpoint(f"{prefix}/end")
             return
         time.sleep(interval)
 
@@ -328,6 +369,8 @@ def cmd_watch(interval: int = 300) -> None:
 def cmd_submit() -> None:
     st = api("GET", "status")
     save_state(st)
+    if not flag(st, "submit_open"):
+        die(f"submissions are closed in {st['phase']}", 3)
     sha = cmd_checkpoint("submit")
     code, _ = run_pytest(public_test_paths(), quiet=True)
     results_path = os.path.join(ROOT, "public_results.json")

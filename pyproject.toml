@@ -6,6 +6,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "ruff>=0.5,<1"]
+data = ["pandas>=2,<3", "numpy>=1.26,<3"]   # MLE track only
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
