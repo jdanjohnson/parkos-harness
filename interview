@@ -383,7 +383,9 @@ def cmd_submit() -> None:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name in os.listdir(ROOT):
-            if name in ("__pycache__", ".pytest_cache", ".interview_state.json"):
+            if name in ("__pycache__", ".pytest_cache", ".interview_state.json", "node_modules"):
+                continue
+            if os.path.exists(os.path.join(ROOT, name, "pyvenv.cfg")):  # a virtualenv created inside the repo
                 continue
             tar.add(os.path.join(ROOT, name), arcname=name,
                     filter=lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti)
