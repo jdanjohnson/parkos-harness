@@ -75,7 +75,7 @@ def main() -> int:
     token = os.environ.get("ATTEMPT_TOKEN")
     if token:
         try:
-            req = urllib.request.Request(f"{platform.rstrip('/')}/api/cli/status", headers={"Authorization": f"Bearer {token}"})
+            req = urllib.request.Request(f"{platform.rstrip('/')}/api/cli/status", headers={"Authorization": f"Bearer {token}", "User-Agent": "parkos-harness/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 check("platform reachable", resp.status == 200, platform)
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
@@ -86,7 +86,8 @@ def main() -> int:
     gw = os.environ.get("MODEL_BASE_URL")
     if gw:
         try:
-            with urllib.request.urlopen(f"{gw.rstrip('/')}/healthz", timeout=5) as resp:
+            req = urllib.request.Request(f"{gw.rstrip('/')}/healthz", headers={"User-Agent": "parkos-harness/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 check("gateway reachable", resp.status == 200, gw)
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
             check("gateway reachable", False, str(exc))

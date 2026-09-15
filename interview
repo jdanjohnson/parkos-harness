@@ -41,10 +41,13 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+USER_AGENT = "parkos-harness/1.0"
+
+
 def api(method: str, path: str, data: bytes | None = None, headers: dict | None = None, raw: bool = False):
     if not TOKEN:
         die("ATTEMPT_TOKEN not set (it is in your interview email / the platform lobby page)")
-    h = {"Authorization": f"Bearer {TOKEN}"}
+    h = {"Authorization": f"Bearer {TOKEN}", "User-Agent": USER_AGENT}
     h.update(headers or {})
     req = urllib.request.Request(f"{PLATFORM}/api/cli/{path}", data=data, method=method, headers=h)
     try:
