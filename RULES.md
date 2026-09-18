@@ -13,9 +13,8 @@
 - Phase 3 (AI-native extension): AI coding tools **ON**. Application models ON via `scaffold.model.ModelClient` (`lot-fast`, `lot-deep`).
 - Phase 4 (Defense): AI OFF.
 
-## MLE (95 min)
+## MLE
 
-- Tour + Part 2 (Evaluate v2): **AI coding tools ON** — use whatever you normally use. No application models in this track.
-- Part 3 (Harden): **AI coding tools OFF**. Close every assistant before the clock turns; the interviewer will ask.
-- Part 4 (Defense): AI OFF.
+- Default pack (60 min): Part 1 (Investigate, 30 min): **AI coding tools ON** — use whatever you normally use. Part 2 (Conversation, 25 min): no coding; your `candidate/` folder is handed in automatically when it starts. No application models in this track.
+- Legacy pack (95 min): Tour + Part 2 (Evaluate v2): AI ON. Part 3 (Harden): **AI coding tools OFF** — close every assistant before the clock turns; the interviewer will ask. Part 4 (Defense): AI OFF.
 - Needs `pandas` + `numpy`: `pip install -e '.[dev,data]'` the day before, then `INTERVIEW_ROLE=mle ./check`.

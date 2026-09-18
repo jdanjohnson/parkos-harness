@@ -107,6 +107,25 @@ def phase_b_unlocked() -> bool:
     return pack_loaded() and not os.path.isdir(os.path.join(PROBLEM, ".phase_b"))
 
 
+def has_phase_b(meta: dict | None = None) -> bool:
+    """Packs with no sealed Part B (pack.json phase_b_files == []) never show Part B state."""
+    if meta is None:
+        if not pack_loaded():
+            return True
+        with open(os.path.join(PROBLEM, "pack.json")) as fh:
+            meta = json.load(fh)
+    return bool(meta.get("phase_b_files"))
+
+
+HANDED_IN = os.path.join(PROBLEM, ".handed_in")
+
+
+def auto_hand_in(st: dict, verbose: bool = True) -> None:
+    """Server flag auto_submit (tracks with no submit step): hand the working tree in once, the first time we see it."""
+    if flag(st, "auto_submit") and pack_loaded() and not os.path.exists(HANDED_IN):
+        cmd_submit(st, verbose=verbose)
+
+
 def unseal(tgz: bytes) -> dict:
     if pack_loaded():
         return json.load(open(os.path.join(PROBLEM, "pack.json")))
@@ -118,7 +137,8 @@ def unseal(tgz: bytes) -> dict:
     with open(os.path.join(PROBLEM, "pack.json")) as fh:
         meta = json.load(fh)
     hidden = os.path.join(PROBLEM, ".phase_b")
-    os.makedirs(hidden, exist_ok=True)
+    if has_phase_b(meta):
+        os.makedirs(hidden, exist_ok=True)
     for rel in meta.get("phase_b_files", []):
         src = os.path.join(PROBLEM, rel)
         if os.path.exists(src):
@@ -194,7 +214,7 @@ def sync_pack(st: dict, verbose: bool = True) -> None:
         meta = unseal(api("GET", "pack", raw=True))
         if verbose:
             print(f"Problem pack loaded: {meta['variant']} ({time.time() - t0:.1f}s) → TASK.md, problem/")
-    if flag(st, "phase_b_open") and pack_loaded() and not phase_b_unlocked():
+    if flag(st, "phase_b_open") and pack_loaded() and has_phase_b() and not phase_b_unlocked():
         unhide_phase_b()
         if verbose:
             print("Part B unlocked: TASK_B.md appended to TASK.md; its fixtures + tests are now in problem/")
@@ -220,7 +240,8 @@ def pin_design_record(st: dict) -> None:
 def run_pytest(paths: list[str], quiet: bool = False) -> tuple[int, str]:
     if not paths:
         if not quiet:
-            print("no tests for this phase yet — public tests arrive when the next part unseals")
+            print("no tests in this pack — nothing to run" if pack_loaded() and not has_phase_b()
+                  else "no tests for this phase yet — this pack has none here (they arrive with a later part, if it has one)")
         return 0, "no tests for this phase yet"
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA", *paths],
                        cwd=ROOT, capture_output=True, text=True, check=False)
@@ -240,7 +261,7 @@ def public_test_paths() -> list[str]:
 def public_summary() -> str:
     paths = public_test_paths()
     if not paths:
-        return "no public tests yet"
+        return "no tests in this pack" if not has_phase_b() else "no public tests yet"
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--co", *paths],
                        cwd=ROOT, capture_output=True, text=True, check=False)
     total = sum(1 for line in r.stdout.splitlines() if "::" in line)
@@ -265,16 +286,28 @@ def cmd_start() -> None:
     pin_design_record(st)
 
 
+def model_access(st: dict) -> str:
+    """"gateway" / "<name> CLI" / "none — rules only" — never prints URLs or tokens."""
+    try:
+        sys.path.insert(0, ROOT)
+        from scaffold.model import describe_access
+        return describe_access(st)
+    except Exception:
+        return "none — rules only"
+
+
 def cmd_status() -> None:
     st = api("GET", "status")
     save_state(st)
     sync_pack(st)
     pin_design_record(st)
+    auto_hand_in(st)
     ph = st["phase"]
     print(f"{st.get('label', ph)} · {remaining(st)} remaining · AI coding tools: {st.get('coding_ai', '?')}"
           + (f" · application models: {st['models']}" if st.get("models") else ""))
+    print(f"model: {model_access(st)}")
     print(f"Problem pack: {'loaded — ' + public_summary() if pack_loaded() else 'sealed (opens in a later phase)'}"
-          + ("" if not pack_loaded() else (" · Part B: unlocked" if phase_b_unlocked() else " · Part B: hidden until a later phase"))
+          + ("" if not (pack_loaded() and has_phase_b()) else (" · Part B: unlocked" if phase_b_unlocked() else " · Part B: hidden until a later phase"))
           + ("" if flag(st, "submit_open") else " · submissions closed right now"))
     rf = record_file(st)
     if os.path.exists(rf):
@@ -357,6 +390,7 @@ def cmd_watch(interval: int = 300) -> None:
         save_state(st)
         sync_pack(st, verbose=False)
         pin_design_record(st)
+        auto_hand_in(st)
         cur = st.get("checkpoint_prefix")
         if cur:
             prefix = cur
@@ -369,9 +403,10 @@ def cmd_watch(interval: int = 300) -> None:
         time.sleep(interval)
 
 
-def cmd_submit() -> None:
-    st = api("GET", "status")
-    save_state(st)
+def cmd_submit(st: dict | None = None, verbose: bool = True) -> None:
+    if st is None:
+        st = api("GET", "status")
+        save_state(st)
     if not flag(st, "submit_open"):
         die(f"submissions are closed in {st['phase']}", 3)
     sha = cmd_checkpoint("submit")
@@ -403,6 +438,12 @@ def cmd_submit() -> None:
         part("public_results", "public_results.json", "application/json", fh.read())
     body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"sha\"\r\n\r\n{sha}\r\n--{boundary}--\r\n".encode())
     resp = api("POST", "submit", body.getvalue(), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    if flag(st, "auto_submit"):
+        with open(HANDED_IN, "w") as fh:
+            fh.write(sha + "\n")
+        if verbose:
+            print(f"handed in {sha} (snapshot of candidate/ → {resp.get('submission_id')}). Keep your editor open — this is what we talk from.")
+        return
     print(f"submitted {sha} → submission {resp.get('submission_id')}. Your working tree is frozen for scoring; you may keep the editor open.")
 
 
