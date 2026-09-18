@@ -330,6 +330,8 @@ def cmd_status() -> None:
         print(f"OFFLINE · pack {pack_meta()['variant']} · the interviewer keeps time; AI coding tools: {st.get('coding_ai', 'ON')}")
         print(f"model: {model_access(st)}")
         print(f"Problem pack: loaded — {public_summary()} · read TASK.md · when told to stop:  ./interview handin")
+        if has_phase_b() and not phase_b_unlocked():
+            print("Part B: sealed — when the interviewer says so:  ./interview open-part-b")
         return
     st = api("GET", "status")
     save_state(st)
@@ -469,10 +471,26 @@ def build_bundle(extra: dict[str, bytes] | None = None) -> tuple[bytes, bytes]:
         return buf.getvalue(), fh.read()
 
 
+def pack_meta_from_file(tgz: bytes) -> dict:
+    """pack.json out of a sealed pack, read in memory — validates the file before anything is written."""
+    with tarfile.open(fileobj=io.BytesIO(tgz), mode="r:gz") as tar:
+        try:
+            fh = tar.extractfile("pack.json")
+        except KeyError:
+            fh = None
+        if fh is None:
+            raise KeyError("pack.json")
+        meta = json.load(fh)
+    if not isinstance(meta, dict) or not isinstance(meta.get("variant"), str) or not meta["variant"]:
+        raise KeyError("variant")
+    return meta
+
+
 def cmd_offline(pack_path: str | None) -> None:
     """Install a pack from a file the interviewer sent (they download it from the admin page) and mark this checkout offline:
     every later command works without the platform; ./interview handin writes the file to send back. With a pack already
-    loaded (network died mid-interview) the file is optional: only the mode flips, the pack stays as is."""
+    loaded (network died mid-interview) the file is optional: only the mode flips, the pack stays as is. A pack with a sealed
+    Part B stays sealed until the interviewer says `./interview open-part-b`."""
     if pack_loaded():
         meta = pack_meta()
         print(f"problem pack already loaded ({meta['variant']}); switching this checkout to offline mode")
@@ -484,17 +502,49 @@ def cmd_offline(pack_path: str | None) -> None:
         with open(pack_path, "rb") as fh:
             data = fh.read()
         try:
-            meta = unseal(data)
-        except (tarfile.TarError, OSError, json.JSONDecodeError, KeyError) as exc:
+            meta = pack_meta_from_file(data)
+        except (tarfile.TarError, OSError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
+            die(f"not a problem pack: {pack_path} ({exc})")
+        # what unseal() writes outside problem/: put back as it was if the install fails half-way
+        task_md = os.path.join(ROOT, "TASK.md")
+        prior_task = open(task_md, "rb").read() if os.path.exists(task_md) else None
+        fresh = [p for p in (os.path.join(ROOT, d) for d in meta.get("starter_files", {}).values()) if not os.path.exists(p)]
+        try:
+            unseal(data)
+        except (tarfile.TarError, OSError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
             shutil.rmtree(PROBLEM, ignore_errors=True)
             os.makedirs(PROBLEM, exist_ok=True)
+            for p in fresh:
+                if os.path.exists(p):
+                    os.remove(p)
+            if prior_task is None:
+                if os.path.exists(task_md):
+                    os.remove(task_md)
+            else:
+                with open(task_md, "wb") as fh:
+                    fh.write(prior_task)
             die(f"not a problem pack: {pack_path} ({exc})")
         print(f"Problem pack loaded (offline): {meta['variant']} → TASK.md, problem/")
     st = {**load_state(), "offline": True, "phase": "offline", "label": "Offline", "pack_open": True, "submit_open": True,
           "coding_ai": "ON", "variant": meta["variant"], "offline_since": datetime.now(timezone.utc).isoformat()}
     save_state(st)
     print("You need no network from here. Read TASK.md; work in candidate/; run ./interview status any time.")
+    if has_phase_b() and not phase_b_unlocked():
+        print("Part B is sealed; when the interviewer says so:  ./interview open-part-b")
     print("When the interviewer says stop:  ./interview handin  → send them the file it names.")
+
+
+def cmd_open_part_b() -> None:
+    """Offline stand-in for the server opening Part B: the interviewer keeps the clock and tells the candidate when to run this."""
+    if not offline():
+        die("only for offline checkouts — online, Part B opens by itself when the interviewer advances the phase")
+    if not pack_loaded() or not has_phase_b():
+        die("this pack has no sealed Part B")
+    if phase_b_unlocked():
+        print("Part B is already open")
+        return
+    unhide_phase_b()
+    print("Part B unlocked: TASK_B.md appended to TASK.md; its fixtures + tests are now in problem/")
 
 
 def cmd_handin() -> None:
@@ -571,6 +621,8 @@ def main(argv: list[str]) -> None:
             cmd_offline(rest[0] if rest else None)
         elif cmd == "handin":
             cmd_handin()
+        elif cmd == "open-part-b":
+            cmd_open_part_b()
         else:
             die(f"unknown command {cmd!r}; see ./interview help")
     except RuntimeError as exc:

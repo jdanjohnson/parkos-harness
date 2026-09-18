@@ -37,7 +37,7 @@ def connectivity(platform: str, token: str | None) -> tuple[bool, str]:
     stack — separates a Python/CA problem from a network block) and IPv4-only (some hotspots/VPNs break IPv6 to Cloudflare)."""
     base = platform.rstrip("/")
     parts = urllib.parse.urlsplit(base)
-    host, port = parts.hostname or base, parts.port or 443
+    host, port = parts.hostname or base, parts.port or (80 if parts.scheme == "http" else 443)
     url = f"{base}/api/cli/status" if token else f"{base}/healthz"
     hdr = {"User-Agent": "parkos-harness/1.0", **({"Authorization": f"Bearer {token}"} if token else {})}
     try:
