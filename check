@@ -116,16 +116,20 @@ def main() -> int:
     tests = os.path.join(ROOT, "harness", "tests")
     if os.path.isdir(tests):
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", tests],
-                           cwd=ROOT, capture_output=True, text=True)
+                           cwd=ROOT, capture_output=True, text=True, check=False)
         check("harness self-tests", r.returncode == 0, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-200:])
 
-    r = subprocess.run(["git", "config", "user.email"], cwd=ROOT, capture_output=True, text=True)
+    r = subprocess.run(["git", "config", "user.email"], cwd=ROOT, capture_output=True, text=True, check=False)
     check("git identity", bool(r.stdout.strip()), r.stdout.strip() or "git config user.email <you>")
-    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT, capture_output=True, text=True)
+    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT, capture_output=True, text=True, check=False)
     check("git repo", r.stdout.strip() == "true")
 
     from scaffold.events import ALL_SPOTS  # noqa: F401 - import path sanity
-    check("problem/ empty (pack sealed)", not os.path.exists(os.path.join(ROOT, "problem", "pack.json")))
+    pack_loaded = os.path.exists(os.path.join(ROOT, "problem", "pack.json"))
+    if offline_mode():
+        check("problem pack loaded (offline)", pack_loaded, "" if pack_loaded else "run ./interview offline <pack.tgz>")
+    else:
+        check("problem/ empty (pack sealed)", not pack_loaded)
 
     platform = os.environ.get("PLATFORM_BASE_URL", "https://parkos.stationed.net")
     token = os.environ.get("ATTEMPT_TOKEN")
