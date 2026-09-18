@@ -17,10 +17,20 @@ from scaffold.model import (
     first_json_object,
 )
 
+NPM_SHIM = ('@ECHO off\r\nSETLOCAL\r\nSET dp0=%~dp0\r\nIF EXIST "%dp0%\\node.exe" (SET "_prog=%dp0%\\node.exe") ELSE (SET "_prog=node")\r\n'
+            'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\{target}" %*\r\n')
+
 
 def _fake_cli(tmp_path, name, body):
+    """A `name` CLI on PATH: a shebang script on POSIX; on Windows a `name.py` behind an npm-style `name.cmd` shim."""
+    script = "import sys, json, os, time\n" + body
+    if sys.platform == "win32":
+        (tmp_path / f"{name}.py").write_text(script)
+        p = tmp_path / f"{name}.cmd"
+        p.write_text(NPM_SHIM.format(target=f"{name}.py"))
+        return p
     p = tmp_path / name
-    p.write_text(f"#!{sys.executable}\nimport sys, json, os, time\n" + body)
+    p.write_text(f"#!{sys.executable}\n" + script)
     p.chmod(p.stat().st_mode | stat.S_IXUSR)
     return p
 
@@ -39,6 +49,49 @@ def test_argv_table():
     assert cli_argv("codex", "hi") == ["codex", "exec", "hi"]
     assert cli_argv("cursor-agent", "hi") == ["cursor-agent", "-p", "hi"]
     assert cli_argv("gemini", "hi") == ["gemini", "-p", "hi"]
+
+
+def test_resolve_cli_bypasses_npm_cmd_shim(tmp_path):
+    target = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+    target.parent.mkdir(parents=True)
+    target.write_text("")
+    shim = tmp_path / "claude.cmd"
+    shim.write_text(NPM_SHIM.format(target="node_modules\\@anthropic-ai\\claude-code\\cli.js"))
+    node = tmp_path / "bin" / ("node.exe" if sys.platform == "win32" else "node")
+    node.parent.mkdir()
+    node.write_text("")
+    node.chmod(0o755)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", str(node.parent))
+        assert M.resolve_cli(str(shim)) == [str(node), str(target)]
+        py_target = tmp_path / "tool.py"
+        py_target.write_text("")
+        py_shim = tmp_path / "tool.cmd"
+        py_shim.write_text(NPM_SHIM.format(target="tool.py"))
+        assert M.resolve_cli(str(py_shim)) == [sys.executable, str(py_target)]
+        mp.setenv("PATH", str(tmp_path / "nowhere"))
+        assert M.resolve_cli(str(shim)) == [str(shim)]  # node not on PATH: fall back to the shim itself
+    missing = tmp_path / "gone.cmd"
+    missing.write_text(NPM_SHIM.format(target="gone.js"))
+    assert M.resolve_cli(str(missing)) == [str(missing)]  # shim target does not exist
+    opaque = tmp_path / "opaque.cmd"
+    opaque.write_text("@ECHO off\r\nsomething-else %*\r\n")
+    assert M.resolve_cli(str(opaque)) == [str(opaque)]  # not an npm shim
+    assert M.resolve_cli("/usr/local/bin/claude") == ["/usr/local/bin/claude"]
+    assert M.resolve_cli(r"C:\tools\claude.exe") == [r"C:\tools\claude.exe"]
+
+
+def test_cli_behind_cmd_shim_runs_end_to_end(cli_env):
+    (cli_env / "tool.py").write_text('import sys, json\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
+    shim = cli_env / "tool.cmd"
+    shim.write_text(NPM_SHIM.format(target="tool.py"))
+    shim.chmod(0o755)
+    os.environ["MODEL_CLI"] = "tool.cmd"
+    try:
+        r = ModelClient(provider="cli").complete(model="lot-fast", messages=[{"role": "user", "content": 'say "hi"\nline 2'}], response_schema={})
+    finally:
+        del os.environ["MODEL_CLI"]
+    assert r.content == {"argv": ["-p", 'say "hi"\nline 2\n\nReply with only JSON matching this schema: {}']}
 
 
 def test_prompt_and_json_extraction():
@@ -91,3 +144,30 @@ def test_gateway_unreachable_falls_back_to_cli(cli_env):
 def test_describe_access_none(cli_env):
     assert M.describe_access({}) == "none — rules only"
     assert M.describe_access({"gateway_url": "http://g", "models": "ON"}) == "gateway"
+
+
+def test_auto_without_configured_gateway_goes_straight_to_cli(cli_env, monkeypatch):
+    _fake_cli(cli_env, "codex", 'print("from codex")\n')
+    import urllib.request
+
+    def no_probe(req, timeout):
+        raise AssertionError("gateway probed although not configured")
+    monkeypatch.setattr(urllib.request, "urlopen", no_probe)
+    c = ModelClient(timeout=30)
+    assert c.gateway_configured is False
+    assert c.complete(model="lot-fast", messages=[{"role": "user", "content": "U"}]).content == "from codex"
+    assert c.last_provider == "cli:codex"
+
+
+def test_configured_outage_503_never_falls_back_to_cli(cli_env, monkeypatch):
+    _fake_cli(cli_env, "claude", 'print("should not run")\n')
+    import urllib.error
+    import urllib.request
+
+    def boom(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 503, "outage", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    c = ModelClient(base_url="http://gw", timeout=1)
+    with pytest.raises(ModelUnavailable, match="gateway outage") as ei:
+        c.complete(model="lot-fast", messages=[{"role": "user", "content": "U"}])
+    assert ei.value.outage is True and c.last_provider is None

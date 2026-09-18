@@ -73,7 +73,7 @@ def offline_mode() -> bool:
     state = os.path.join(ROOT, ".interview_state.json")
     if not os.path.exists(state):
         return False
-    with open(state) as fh:
+    with open(state, encoding="utf-8") as fh:
         try:
             return bool(json.load(fh).get("offline"))
         except json.JSONDecodeError:

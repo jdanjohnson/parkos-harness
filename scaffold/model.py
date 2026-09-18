@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +37,10 @@ JSON_INSTRUCTION = "Reply with only JSON matching this schema: "
 
 class ModelUnavailable(Exception):
     """Raised when no provider can answer: gateway outage/unreachable, no agent CLI on PATH, CLI failed or timed out."""
+
+    def __init__(self, msg: str = "", *, outage: bool = False) -> None:
+        super().__init__(msg)
+        self.outage = outage  # True for a configured gateway outage (503): the degradation path, never CLI fallback
 
 
 class ModelRequestError(Exception):
@@ -78,6 +84,31 @@ def find_cli(env: dict[str, str] | None = None) -> str | None:
 def cli_argv(name: str, prompt: str) -> list[str]:
     template = CLI_COMMANDS.get(name) or (name, "-p", "{prompt}")
     return [prompt if part == "{prompt}" else part for part in template]
+
+
+_SHIM_TARGET = re.compile(r'"%(?:~dp0|dp0%)\\([^"]+)"\s+%\*')
+_SHIM_INTERPRETERS = {".js": "node", ".cjs": "node", ".mjs": "node", ".py": sys.executable}
+
+
+def resolve_cli(exe: str) -> list[str]:
+    """argv prefix that runs `exe` without a shell. On Windows, npm installs CLIs as `<name>.cmd` batch shims
+    (`node "%dp0%\\...\\cli.js" %*`); running those through cmd.exe mangles quotes/newlines in the prompt, so
+    the shim is bypassed and its target is run with the interpreter directly."""
+    if not exe.lower().endswith((".cmd", ".bat")):
+        return [exe]
+    try:
+        with open(exe, encoding="utf-8", errors="replace") as fh:
+            m = _SHIM_TARGET.search(fh.read())
+    except OSError:
+        m = None
+    if m is None:
+        return [exe]
+    target = os.path.join(os.path.dirname(exe), m.group(1).replace("\\", os.sep))
+    interp = _SHIM_INTERPRETERS.get(os.path.splitext(target)[1].lower())
+    if interp is None or not os.path.exists(target):
+        return [exe]
+    interp_path = interp if os.path.isabs(interp) else shutil.which(interp)
+    return [interp_path, target] if interp_path else [exe]
 
 
 def build_prompt(messages: list[dict[str, str]], response_schema: dict[str, Any] | None = None) -> str:
@@ -136,12 +167,12 @@ class ModelClient:
                  temperature: float = 0.0) -> ModelResponse:
         if model not in MODELS:
             raise ModelRequestError(f"unknown model {model!r}; use one of {MODELS}")
-        if self.provider == "cli":
+        if self.provider == "cli" or (self.provider == "auto" and not self.gateway_configured):
             return self._complete_cli(model, messages, response_schema)
         try:
             return self._complete_gateway(model, messages, response_schema, temperature)
-        except ModelUnavailable:
-            if self.provider == "gateway" or find_cli() is None:
+        except ModelUnavailable as exc:
+            if self.provider == "gateway" or exc.outage or find_cli() is None:
                 raise
             return self._complete_cli(model, messages, response_schema)
 
@@ -157,7 +188,7 @@ class ModelClient:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             if exc.code == 503:
-                raise ModelUnavailable("gateway outage") from exc
+                raise ModelUnavailable("gateway outage", outage=True) from exc
             detail = exc.read().decode(errors="replace")
             raise ModelRequestError(f"gateway {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
@@ -172,6 +203,7 @@ class ModelClient:
         if name is None:
             raise ModelUnavailable("no model access: gateway not reachable and no agent CLI (claude/codex/cursor-agent/gemini) on PATH")
         argv = cli_argv(name, build_prompt(messages, response_schema))
+        argv = resolve_cli(shutil.which(name) or name) + argv[1:]
         t0 = time.time()
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=self.cli_timeout, stdin=subprocess.DEVNULL, check=False)

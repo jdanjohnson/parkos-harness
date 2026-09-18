@@ -28,7 +28,7 @@ def main() -> int:
         print(f"  {'✓' if status == 'PASSED' else '✗'} {name}")
     passed = sum(1 for _, s in rows if s == "PASSED")
     print(f"{passed}/{len(rows)} public checks passing")
-    with open(os.path.join(ROOT, "public_results.json"), "w") as fh:
+    with open(os.path.join(ROOT, "public_results.json"), "w", encoding="utf-8") as fh:
         json.dump({"passed": passed, "failed": len(rows) - passed, "checks": dict(rows), "exit_code": r.returncode}, fh, indent=2)
     if r.returncode not in (0, 1):
         print(r.stdout[-2000:], r.stderr[-2000:])
