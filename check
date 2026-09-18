@@ -52,7 +52,7 @@ def connectivity(platform: str, token: str | None) -> tuple[bool, str]:
     # Python failed: run the cheap differential diagnostics.
     curl = "curl not installed"
     if shutil.which("curl"):
-        r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-m", "10", "-w", "%{http_code}", f"{base}/healthz"], capture_output=True, text=True, check=False)
+        r = subprocess.run(["curl", "-sS", "-o", os.devnull, "-m", "10", "-w", "%{http_code}", f"{base}/healthz"], capture_output=True, text=True, check=False)
         curl = f"HTTP {r.stdout.strip()}" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["failed"])[-1]
     try:
         v4 = socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0]
