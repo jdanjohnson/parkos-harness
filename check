@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +26,58 @@ results: list[tuple[str, bool, str]] = []
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, ok, detail))
     print(f"[{'ok' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+
+
+OFFLINE_STEPS = ("turn off VPN/proxy or use a phone hotspot and re-run ./check; or go offline: ask the interviewer for the pack file, "
+                 "then ./interview offline <pack.tgz> (no network needed after that; hand in with ./interview handin)")
+
+
+def connectivity(platform: str, token: str | None) -> tuple[bool, str]:
+    """Probe the platform three ways so a failure says *where* it breaks: Python (what ./interview uses), curl (a second TLS
+    stack — separates a Python/CA problem from a network block) and IPv4-only (some hotspots/VPNs break IPv6 to Cloudflare)."""
+    base = platform.rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    host, port = parts.hostname or base, parts.port or 443
+    url = f"{base}/api/cli/status" if token else f"{base}/healthz"
+    hdr = {"User-Agent": "parkos-harness/1.0", **({"Authorization": f"Bearer {token}"} if token else {})}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=10) as resp:
+            if resp.status == 200:
+                return True, base if token else f"{base} (set ATTEMPT_TOKEN to verify your token too)"
+            py = f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"{exc.code} from {url} — wrong or expired ATTEMPT_TOKEN? ({exc.read()[:120].decode(errors='replace')})"
+    except (urllib.error.URLError, OSError) as exc:
+        py = str(exc.reason if isinstance(exc, urllib.error.URLError) else exc)
+    # Python failed: run the cheap differential diagnostics.
+    curl = "curl not installed"
+    if shutil.which("curl"):
+        r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-m", "10", "-w", "%{http_code}", f"{base}/healthz"], capture_output=True, text=True, check=False)
+        curl = f"HTTP {r.stdout.strip()}" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["failed"])[-1]
+    try:
+        v4 = socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0]
+        with socket.create_connection((v4, port), timeout=5):
+            ipv4 = f"TCP to {v4}:{port} ok"
+    except OSError as exc:
+        ipv4 = f"TCP to {host}:{port} over IPv4 failed ({exc})"
+    if curl.startswith("HTTP 200"):
+        why = "Python cannot do TLS to the platform but curl can — a proxy/VPN or Python without CA certificates; "
+    elif "ok" in ipv4:
+        why = "TCP connects but TLS/HTTP does not — a VPN/proxy is intercepting the connection; "
+    else:
+        why = "nothing on this machine reaches the platform — the network blocks it; "
+    return False, f"python: {py} · curl: {curl} · {ipv4}. {why}{OFFLINE_STEPS}"
+
+
+def offline_mode() -> bool:
+    state = os.path.join(ROOT, ".interview_state.json")
+    if not os.path.exists(state):
+        return False
+    with open(state) as fh:
+        try:
+            return bool(json.load(fh).get("offline"))
+        except json.JSONDecodeError:
+            return False
 
 
 def main() -> int:
@@ -73,15 +129,11 @@ def main() -> int:
 
     platform = os.environ.get("PLATFORM_BASE_URL", "https://parkos.stationed.net")
     token = os.environ.get("ATTEMPT_TOKEN")
-    if token:
-        try:
-            req = urllib.request.Request(f"{platform.rstrip('/')}/api/cli/status", headers={"Authorization": f"Bearer {token}", "User-Agent": "parkos-harness/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                check("platform reachable", resp.status == 200, platform)
-        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-            check("platform reachable", False, str(exc))
+    if offline_mode():
+        check("platform reachable", True, "skipped — this checkout is in offline mode (./interview offline)")
     else:
-        check("platform reachable", True, "skipped (set ATTEMPT_TOKEN to verify)")
+        ok, detail = connectivity(platform, token)
+        check("platform reachable", ok, detail)
 
     gw = os.environ.get("MODEL_BASE_URL")
     if gw:

@@ -10,6 +10,10 @@
   watch        auto-commit loop while the server reports a checkpoint phase (every 5 min -> <prefix>/00, /05, ...)
   submit       bundle repo @ HEAD + public results -> platform
 
+Offline (your machine cannot reach the platform — VPN, proxy, hotel Wi-Fi):
+  offline F    install a problem pack from a file the interviewer sent you (no network needed after this)
+  handin       write your work to a file (parkos-submission-<sha>.tar.gz) — send it to the interviewer
+
 Phases, AI policy and what is unsealed when are decided by the platform (/api/cli/status), not by this file;
 the same CLI serves every role.
 """
@@ -44,21 +48,35 @@ def die(msg: str, code: int = 1) -> None:
 USER_AGENT = "parkos-harness/1.0"
 
 
+RETRIES = 3          # GET attempts on network errors (back-off 1 s, 2 s); POSTs are not retried (a retried submit could land twice)
+OFFLINE_HELP = ("If this keeps failing: turn off VPN/proxy or use a phone hotspot, or go offline — ask the interviewer for the\n"
+                "  pack file and run  ./interview offline <pack.tgz>  ; hand in at the end with  ./interview handin")
+
+
 def api(method: str, path: str, data: bytes | None = None, headers: dict | None = None, raw: bool = False):
+    if offline():
+        raise RuntimeError(f"this checkout is in offline mode (./interview offline); '{path}' needs the platform — use ./interview handin at the end")
     if not TOKEN:
         die("ATTEMPT_TOKEN not set (it is in your interview email / the platform lobby page)")
     h = {"Authorization": f"Bearer {TOKEN}", "User-Agent": USER_AGENT}
     h.update(headers or {})
-    req = urllib.request.Request(f"{PLATFORM}/api/cli/{path}", data=data, method=method, headers=h)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read()
-            return body if raw else json.loads(body or b"{}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        raise RuntimeError(f"{exc.code} {path}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"platform unreachable at {PLATFORM}: {exc.reason}") from exc
+    attempts = RETRIES if method == "GET" else 1
+    for i in range(attempts):
+        req = urllib.request.Request(f"{PLATFORM}/api/cli/{path}", data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read()
+                return body if raw else json.loads(body or b"{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"{exc.code} {path}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if i + 1 < attempts:
+                print(f"(network error: {reason} — retrying in {2 ** i}s)", file=sys.stderr)
+                time.sleep(2 ** i)
+                continue
+            raise RuntimeError(f"platform unreachable at {PLATFORM}: {reason}\n  {OFFLINE_HELP}") from exc
 
 
 def post_json(path: str, obj: dict):
@@ -67,6 +85,10 @@ def post_json(path: str, obj: dict):
 
 def load_state() -> dict:
     return json.load(open(STATE)) if os.path.exists(STATE) else {}
+
+
+def offline() -> bool:
+    return bool(load_state().get("offline"))
 
 
 def save_state(s: dict) -> None:
@@ -103,6 +125,11 @@ def pack_loaded() -> bool:
     return os.path.exists(os.path.join(PROBLEM, "pack.json"))
 
 
+def pack_meta() -> dict:
+    with open(os.path.join(PROBLEM, "pack.json")) as fh:
+        return json.load(fh)
+
+
 def phase_b_unlocked() -> bool:
     return pack_loaded() and not os.path.isdir(os.path.join(PROBLEM, ".phase_b"))
 
@@ -118,6 +145,7 @@ def has_phase_b(meta: dict | None = None) -> bool:
 
 
 HANDED_IN = os.path.join(PROBLEM, ".handed_in")
+SUBMISSION_PREFIX = "parkos-submission-"   # ./interview handin output files; never bundled or committed
 
 
 def auto_hand_in(st: dict, verbose: bool = True) -> None:
@@ -297,6 +325,12 @@ def model_access(st: dict) -> str:
 
 
 def cmd_status() -> None:
+    if offline():
+        st = load_state()
+        print(f"OFFLINE · pack {pack_meta()['variant']} · the interviewer keeps time; AI coding tools: {st.get('coding_ai', 'ON')}")
+        print(f"model: {model_access(st)}")
+        print(f"Problem pack: loaded — {public_summary()} · read TASK.md · when told to stop:  ./interview handin")
+        return
     st = api("GET", "status")
     save_state(st)
     sync_pack(st)
@@ -315,6 +349,9 @@ def cmd_status() -> None:
 
 
 def cmd_pack() -> None:
+    if offline():
+        print("pack ok (offline mode — already installed from file)" if pack_loaded() else "error: offline mode but no pack in problem/")
+        return
     st = api("GET", "status")
     save_state(st)
     if not flag(st, "pack_open"):
@@ -364,17 +401,20 @@ def cmd_replay(fixture: str, builder: str = "candidate.main:build") -> None:
 
 
 def cmd_checkpoint(tag: str | None = None) -> str:
-    git("add", "-A", "--", ".", ":!problem/", ":!.interview_state.json")
+    git("add", "-A", "--", ".", ":!problem/", ":!.interview_state.json", f":!{SUBMISSION_PREFIX}*")
     git("commit", "-q", "--allow-empty", "-m", f"checkpoint {tag or datetime.now(timezone.utc).strftime('%H:%M:%SZ')}", check=True)
     sha = git("rev-parse", "--short", "HEAD")
     if tag:
         git("tag", "-f", tag, check=False)
     diffstat = git("show", "--stat", "--oneline", "HEAD", check=False).splitlines()[-1] if tag else ""
     st = load_state()
+    if offline():
+        print(f"checkpoint {tag or ''} {sha} (offline: local git only)")
+        return sha
     try:
         post_json("checkpoint", {"sha": sha, "phase": st.get("phase", "?"), "diffstat": diffstat, "tag": tag or ""})
     except RuntimeError as exc:
-        print(f"(checkpoint recorded locally only: {exc})")
+        print(f"(checkpoint recorded locally only: {str(exc).splitlines()[0]})")
     print(f"checkpoint {tag or ''} {sha}")
     return sha
 
@@ -403,13 +443,10 @@ def cmd_watch(interval: int = 300) -> None:
         time.sleep(interval)
 
 
-def cmd_submit(st: dict | None = None, verbose: bool = True) -> None:
-    if st is None:
-        st = api("GET", "status")
-        save_state(st)
-    if not flag(st, "submit_open"):
-        die(f"submissions are closed in {st['phase']}", 3)
-    sha = cmd_checkpoint("submit")
+def build_bundle(extra: dict[str, bytes] | None = None) -> tuple[bytes, bytes]:
+    """Run the public tests and tar the working tree (minus caches, venvs, state, earlier hand-in files), plus any `extra`
+    in-memory members. Returns (bundle tar.gz bytes, public_results.json bytes) — the same payload whether it goes over the
+    wire or into a file. Callers checkpoint first so HEAD is what gets bundled."""
     code, _ = run_pytest(public_test_paths(), quiet=True)
     results_path = os.path.join(ROOT, "public_results.json")
     if not os.path.exists(results_path):
@@ -418,12 +455,72 @@ def cmd_submit(st: dict | None = None, verbose: bool = True) -> None:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name in os.listdir(ROOT):
-            if name in ("__pycache__", ".pytest_cache", ".interview_state.json", "node_modules"):
+            if name in ("__pycache__", ".pytest_cache", ".interview_state.json", "node_modules") or name.startswith(SUBMISSION_PREFIX):
                 continue
             if os.path.exists(os.path.join(ROOT, name, "pyvenv.cfg")):  # a virtualenv created inside the repo
                 continue
             tar.add(os.path.join(ROOT, name), arcname=name,
                     filter=lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti)
+        for name, blob in (extra or {}).items():
+            ti = tarfile.TarInfo(name)
+            ti.size, ti.mtime = len(blob), int(time.time())
+            tar.addfile(ti, io.BytesIO(blob))
+    with open(results_path, "rb") as fh:
+        return buf.getvalue(), fh.read()
+
+
+def cmd_offline(pack_path: str | None) -> None:
+    """Install a pack from a file the interviewer sent (they download it from the admin page) and mark this checkout offline:
+    every later command works without the platform; ./interview handin writes the file to send back. With a pack already
+    loaded (network died mid-interview) the file is optional: only the mode flips, the pack stays as is."""
+    if pack_loaded():
+        meta = pack_meta()
+        print(f"problem pack already loaded ({meta['variant']}); switching this checkout to offline mode")
+    else:
+        if not pack_path:
+            die("usage: ./interview offline <pack.tar.gz>   (the interviewer downloads this file from their admin page)")
+        if not os.path.exists(pack_path):
+            die(f"no such file: {pack_path}")
+        with open(pack_path, "rb") as fh:
+            data = fh.read()
+        try:
+            meta = unseal(data)
+        except (tarfile.TarError, OSError, json.JSONDecodeError, KeyError) as exc:
+            shutil.rmtree(PROBLEM, ignore_errors=True)
+            os.makedirs(PROBLEM, exist_ok=True)
+            die(f"not a problem pack: {pack_path} ({exc})")
+        print(f"Problem pack loaded (offline): {meta['variant']} → TASK.md, problem/")
+    st = {**load_state(), "offline": True, "phase": "offline", "label": "Offline", "pack_open": True, "submit_open": True,
+          "coding_ai": "ON", "variant": meta["variant"], "offline_since": datetime.now(timezone.utc).isoformat()}
+    save_state(st)
+    print("You need no network from here. Read TASK.md; work in candidate/; run ./interview status any time.")
+    print("When the interviewer says stop:  ./interview handin  → send them the file it names.")
+
+
+def cmd_handin() -> None:
+    """Write the submission to a file instead of uploading it (offline, or when the upload keeps failing). The file is the
+    same bundle ./interview submit would upload, plus HANDIN.json {sha, variant, at}; the interviewer uploads it on the admin page."""
+    if not pack_loaded():
+        die("no problem pack loaded — nothing to hand in", 3)
+    sha = cmd_checkpoint("submit")
+    meta = {"sha": sha, "variant": pack_meta().get("variant"),
+            "at": datetime.now(timezone.utc).isoformat(), "attempt_token": load_state().get("attempt_token", TOKEN)}
+    bundle, _ = build_bundle({"HANDIN.json": json.dumps(meta, indent=1).encode()})
+    out = os.path.join(ROOT, f"{SUBMISSION_PREFIX}{sha}.tar.gz")
+    with open(out, "wb") as fh:
+        fh.write(bundle)
+    print(f"handed in {sha} → {out}  ({os.path.getsize(out) / 1024:.0f} KB)")
+    print("Send that file to the interviewer (email / chat). They upload it on their side; nothing else to do.")
+
+
+def cmd_submit(st: dict | None = None, verbose: bool = True) -> None:
+    if st is None:
+        st = api("GET", "status")
+        save_state(st)
+    if not flag(st, "submit_open"):
+        die(f"submissions are closed in {st['phase']}", 3)
+    sha = cmd_checkpoint("submit")
+    bundle, results = build_bundle()
     boundary = "----parkos" + str(int(time.time()))
     body = io.BytesIO()
 
@@ -433,9 +530,8 @@ def cmd_submit(st: dict | None = None, verbose: bool = True) -> None:
         body.write(data)
         body.write(b"\r\n")
 
-    part("bundle", "bundle.tar.gz", "application/gzip", buf.getvalue())
-    with open(results_path, "rb") as fh:
-        part("public_results", "public_results.json", "application/json", fh.read())
+    part("bundle", "bundle.tar.gz", "application/gzip", bundle)
+    part("public_results", "public_results.json", "application/json", results)
     body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"sha\"\r\n\r\n{sha}\r\n--{boundary}--\r\n".encode())
     resp = api("POST", "submit", body.getvalue(), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
     if flag(st, "auto_submit"):
@@ -471,6 +567,10 @@ def main(argv: list[str]) -> None:
             cmd_watch(int(rest[0]) if rest else 300)
         elif cmd == "submit":
             cmd_submit()
+        elif cmd == "offline":
+            cmd_offline(rest[0] if rest else None)
+        elif cmd == "handin":
+            cmd_handin()
         else:
             die(f"unknown command {cmd!r}; see ./interview help")
     except RuntimeError as exc:
